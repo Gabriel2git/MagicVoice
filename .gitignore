@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build files
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# API Keys
+secret.toml
+!secret.toml.template
+
+# Audio files
+*.wav
+*.mp3

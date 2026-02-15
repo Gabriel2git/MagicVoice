@@ -1,0 +1,8 @@
+dashscope
+sounddevice
+keyboard
+pyperclip
+pystray
+numpy
+pillow
+pyinstaller
