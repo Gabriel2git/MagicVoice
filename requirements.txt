@@ -6,3 +6,4 @@ pystray
 numpy
 pillow
 pyinstaller
+pypiwin32

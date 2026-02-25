@@ -14,6 +14,16 @@ from PIL import Image, ImageDraw
 import pystray
 import logging
 
+# 防止多实例运行
+if sys.platform == 'win32':
+    try:
+        import win32event
+        import win32api
+        from win32com.shell import shellcon
+        from win32com.shell.shell import ShellExecuteEx
+    except ImportError:
+        pass
+
 try:
     import tomli as tomllib
 except ImportError:
@@ -40,6 +50,26 @@ if not API_KEY:
     sys.exit(1)
 
 dashscope.api_key = API_KEY
+
+# 检查是否已有实例运行
+if sys.platform == 'win32':
+    try:
+        # 创建互斥锁
+        mutex_name = 'Global\\MagicVoiceMutex'
+        hmutex = win32event.CreateMutex(None, True, mutex_name)
+        
+        # 检查是否已有实例
+        if win32api.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            print("MagicVoice 已经在运行中...")
+            # 尝试显示已有的实例
+            try:
+                ShellExecuteEx(lpVerb='Open', lpFile=sys.executable, lpParameters='--show', nShow=shellcon.SW_SHOWNORMAL)
+            except:
+                pass
+            sys.exit(0)
+    except:
+        # 如果win32api不可用，跳过检查
+        pass
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
