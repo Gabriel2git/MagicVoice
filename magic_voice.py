@@ -2,20 +2,31 @@ import os
 import sys
 import time
 import threading
-import numpy as np
-import sounddevice as sd
-import keyboard
-import pyperclip
-import dashscope
-import winsound
-from PIL import Image, ImageDraw
-import pystray
 import json
-import tkinter as tk
-from tkinter import messagebox
+
+# 核心模块优先导入
 
 # 防止多实例运行
 import ctypes
+
+# 配置文件路径
+if getattr(sys, 'frozen', False):
+    # 打包后，使用应用所在目录
+    CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'config.toml')
+    CONFIG_JSON = os.path.join(os.path.dirname(sys.executable), 'config.json')
+else:
+    # 开发模式，使用当前文件所在目录
+    CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.toml')
+    CONFIG_JSON = os.path.join(os.path.dirname(__file__), 'config.json')
+
+# 加载 TOML 库
+try:
+    import tomli as tomllib
+except ImportError:
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        raise ImportError("需要安装 tomli: pip install tomli")
 
 # 使用 Windows 互斥锁防止多实例
 try:
@@ -24,7 +35,7 @@ try:
     
     # 创建互斥锁
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    mutex_name = 'Global\MagicVoiceMutex'
+    mutex_name = 'Global\\MagicVoiceMutex_Test'
     
     # 创建互斥锁
     mutex = kernel32.CreateMutexW(None, True, mutex_name)
@@ -37,6 +48,18 @@ try:
         last_error = ctypes.get_last_error()
         if last_error == ERROR_ALREADY_EXISTS:
             print("MagicVoice 已经在运行中...")
+            # 导入 tkinter 并显示提示窗口
+            import tkinter as tk
+            from tkinter import messagebox
+            
+            # 创建一个临时窗口
+            root = tk.Tk()
+            root.withdraw()  # 隐藏主窗口
+            
+            # 显示提示信息
+            messagebox.showinfo("提示", "MagicVoice 已经在运行中，请检查系统托盘图标。")
+            
+            # 退出程序
             sys.exit(0)
         
         # 注册退出时释放互斥锁
@@ -70,6 +93,29 @@ except ImportError:
         import tomllib
     else:
         raise ImportError("需要安装 tomli: pip install tomli")
+
+# 保存 API Key 到 config.json
+def save_api_key(api_key):
+    try:
+        # 确保目录存在
+        config_dir = os.path.dirname(CONFIG_JSON)
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
+        
+        # 写入配置
+        config = {
+            'DASHSCOPE_API_KEY': api_key
+        }
+        
+        # 写入 config.json
+        with open(CONFIG_JSON, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        print(f"API Key 已保存到: {CONFIG_JSON}")
+        return True
+    except Exception as e:
+        print(f"保存 API Key 失败: {e}")
+        return False
 
 # 加载 API 密钥
 def load_api_keys():
@@ -126,14 +172,13 @@ if not LLM_API_KEY:
     sys.exit(1)
 
 # 设置 API Key
-dashscope.api_key = ASR_API_KEY  # ASR 默认使用
 def get_llm_api_key():
     return LLM_API_KEY
 
 # 音频配置
 SAMPLE_RATE = 16000
 CHANNELS = 1
-DTYPE = np.int16
+DTYPE = 'int16'  # 暂时使用字符串，稍后在需要时再导入 numpy
 
 # 模型配置
 ASR_MODELS = ["fun-asr-realtime", "fun-asr-flash-8k-realtime"]
@@ -164,6 +209,11 @@ DEBOUNCE_INTERVAL = 500
 # 热键配置
 HOTKEY_F2 = 'f2'
 HOTKEY_F4 = 'f4'
+HOTKEY_F2_FALLBACK = 'ctrl+shift+f2'
+HOTKEY_F4_FALLBACK = 'ctrl+shift+f4'
+HOTKEY_SUPPRESS = True
+HOTKEY_HANDLES = []
+LOG_FILE = os.path.join(os.path.dirname(CONFIG_FILE), 'magic_voice.log')
 
 # 加载配置
 def load_config():
@@ -204,34 +254,98 @@ def save_config():
     except Exception as e:
         print(f"保存配置失败: {e}")
 
-# 保存 API Key 到 config.json
-def save_api_key(api_key):
+def write_runtime_log(message):
     try:
-        # 确保目录存在
-        config_dir = os.path.dirname(CONFIG_JSON)
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
-        
-        # 写入配置
-        config = {
-            'DASHSCOPE_API_KEY': api_key
-        }
-        
-        # 写入 config.json
-        with open(CONFIG_JSON, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        
-        print(f"API Key 已保存到: {CONFIG_JSON}")
-        return True
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} {message}\n")
+    except Exception:
+        # 日志写入失败不应影响主流程
+        pass
+
+def safe_hotkey_call(name, callback):
+    try:
+        callback()
     except Exception as e:
-        print(f"保存 API Key 失败: {e}")
-        return False
+        write_runtime_log(f"hotkey {name} callback failed: {e}")
+        print(f"热键 {name} 执行失败: {e}")
+
+def normalize_hotkey(value):
+    if not value:
+        return ''
+    return value.strip().lower()
+
+def build_hotkey_candidates(primary, fallback):
+    candidates = []
+    for hotkey in (primary, fallback):
+        normalized = normalize_hotkey(hotkey)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+def clear_registered_hotkeys():
+    global HOTKEY_HANDLES
+    if not HOTKEY_HANDLES:
+        return
+    try:
+        import keyboard
+        for handle in HOTKEY_HANDLES:
+            try:
+                keyboard.remove_hotkey(handle)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    HOTKEY_HANDLES = []
+
+def register_hotkeys():
+    global HOTKEY_HANDLES
+    import keyboard
+
+    clear_registered_hotkeys()
+    HOTKEY_HANDLES = []
+    registered = []
+    failures = []
+
+    hotkey_specs = [
+        ("F2", HOTKEY_F2, HOTKEY_F2_FALLBACK, toggle_f2),
+        ("F4", HOTKEY_F4, HOTKEY_F4_FALLBACK, toggle_f4),
+    ]
+
+    for name, primary, fallback, callback in hotkey_specs:
+        for hotkey in build_hotkey_candidates(primary, fallback):
+            try:
+                handle = keyboard.add_hotkey(
+                    hotkey,
+                    lambda n=name, cb=callback: safe_hotkey_call(n, cb),
+                    suppress=HOTKEY_SUPPRESS
+                )
+                HOTKEY_HANDLES.append(handle)
+                registered.append(f"{name}={hotkey}")
+            except Exception as e:
+                failures.append(f"{name}={hotkey}: {e}")
+
+    if not registered:
+        raise RuntimeError("未成功注册任何热键")
+
+    if failures:
+        write_runtime_log("partial hotkey registration failures: " + " | ".join(failures))
+        print("部分热键注册失败，请检查日志文件。")
+
+    print("热键注册成功: " + ", ".join(registered))
+    write_runtime_log("hotkeys registered: " + ", ".join(registered))
 
 # 加载配置
 load_config()
 
 # 创建设置窗口
 def create_settings_window():
+    import tkinter as tk
+    from tkinter import messagebox
+    
     def on_save():
         api_key = entry.get().strip()
         if not api_key:
@@ -240,9 +354,10 @@ def create_settings_window():
         
         if save_api_key(api_key):
             # 更新全局 API Key
-            global ASR_API_KEY, LLM_API_KEY, dashscope
+            global ASR_API_KEY, LLM_API_KEY
             ASR_API_KEY = api_key
             LLM_API_KEY = api_key
+            import dashscope
             dashscope.api_key = api_key
             
             messagebox.showinfo("成功", "API Key 保存成功，程序将继续运行")
@@ -257,17 +372,46 @@ def create_settings_window():
             print("未输入 API Key，程序退出")
             os._exit(0)
     
+    def test_api_key():
+        api_key = entry.get().strip()
+        if not api_key:
+            messagebox.showerror("错误", "请输入 API Key")
+            return
+        
+        # 测试 API Key 是否有效
+        import dashscope
+        original_api_key = dashscope.api_key
+        dashscope.api_key = api_key
+        
+        try:
+            # 发送一个简单的请求来测试 API Key
+            test_result = dashscope.Generation.call(
+                model="qwen-turbo",
+                messages=[{"role": "user", "content": "测试"}],
+                max_tokens=1
+            )
+            
+            if test_result.status_code == 200:
+                messagebox.showinfo("成功", "API Key 有效")
+            else:
+                messagebox.showerror("错误", f"API Key 无效: {test_result.message}")
+        except Exception as e:
+            messagebox.showerror("错误", f"API Key 测试失败: {e}")
+        finally:
+            # 恢复原来的 API Key
+            dashscope.api_key = original_api_key
+    
     root = tk.Tk()
     root.title("Magic Voice 设置")
-    root.geometry("400x200")
+    root.geometry("400x250")
     root.resizable(False, False)
     
     # 居中显示
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = (screen_width - 400) // 2
-    y = (screen_height - 200) // 2
-    root.geometry(f"400x200+{x}+{y}")
+    y = (screen_height - 250) // 2
+    root.geometry(f"400x250+{x}+{y}")
     
     # 创建框架
     frame = tk.Frame(root, padx=20, pady=20)
@@ -279,11 +423,21 @@ def create_settings_window():
     
     # 输入框
     entry = tk.Entry(frame, width=40, show="*")
-    entry.pack(pady=(0, 15))
+    entry.pack(pady=(0, 10))
+    
+    # 显示当前 API Key（部分隐藏）
+    if ASR_API_KEY:
+        hidden_key = ASR_API_KEY[:4] + "*" * (len(ASR_API_KEY) - 8) + ASR_API_KEY[-4:]
+        current_key_label = tk.Label(frame, text=f"当前 API Key: {hidden_key}", fg="gray")
+        current_key_label.pack(pady=(0, 15))
     
     # 按钮框架
     button_frame = tk.Frame(frame)
     button_frame.pack(fill=tk.X, pady=(10, 0))
+    
+    # 测试按钮
+    test_button = tk.Button(button_frame, text="测试 API Key", command=test_api_key, width=12)
+    test_button.pack(side=tk.LEFT, padx=(0, 10))
     
     # 保存按钮
     save_button = tk.Button(button_frame, text="保存并启动", command=on_save, width=12)
@@ -310,6 +464,7 @@ SYSTEM_PROMPT = '''你是一个智能语音助手，帮助用户回答问题、�
 
 # 创建托盘图标
 def create_icon():
+    from PIL import Image, ImageDraw
     width, height = 64, 64
     image = Image.new('RGB', (width, height), color=(66, 133, 244))
     dc = ImageDraw.Draw(image)
@@ -319,6 +474,8 @@ def create_icon():
 
 # 粘贴文本
 def paste_text(text):
+    import pyperclip
+    import keyboard
     old = pyperclip.paste()
     pyperclip.copy(text)
     keyboard.send('ctrl+v')
@@ -327,6 +484,7 @@ def paste_text(text):
 
 # 生成 AI 响应
 def generate_response(text):
+    import dashscope
     try:
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
         messages.append({'role': 'user', 'content': text})
@@ -479,12 +637,14 @@ class ASRCallbackF4:
         print("F4 识别已关闭")
     
     def on_complete(self):
-        if self.manual_stop and self.full_text:
+        print(f"F4 on_complete 被调用, full_text: {self.full_text[:50] if self.full_text else '空'}")
+        if self.full_text:
             print(f"正在调用 AI ({LLM_MODEL})...")
             response = generate_response(self.full_text)
             if response:
                 print(f"AI 回答: {response}")
                 paste_text(response)
+                import winsound
                 winsound.Beep(600, 150)
     
     def on_error(self, result):
@@ -499,9 +659,6 @@ class ASRCallbackF4:
             if result.is_sentence_end(sentence):
                 self.full_text = text
                 print(f"\n[{ASR_MODEL}] 识别完成: {self.full_text}")
-
-# 导入 ASR 模块
-from dashscope.audio.asr import Recognition, RecognitionCallback
 
 # 音频回调
 def audio_callback(indata, frames, time_info, status):
@@ -524,6 +681,7 @@ def start_global_stream():
     global stream
     if stream is None:
         try:
+            import sounddevice as sd
             stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
@@ -595,35 +753,78 @@ def toggle_f2():
     
     with state_lock:
         if not is_recording_f2:
-            is_recording_f2 = True
-            audio_queue_f2 = []
-            stop_event.clear()
-            start_global_stream()
-            winsound.Beep(1000, 100)
-            print("\nF2 开始录音...")
-            
-            callback_f2 = ASRCallbackF2()
-            recognition_f2 = Recognition(
-                model=ASR_MODEL,
-                format='pcm',
-                sample_rate=SAMPLE_RATE,
-                callback=callback_f2
-            )
-            recognition_f2.start()
-            
-            sender_thread = threading.Thread(target=audio_sender_f2, daemon=True)
-            sender_thread.start()
+            try:
+                is_recording_f2 = True
+                audio_queue_f2 = []
+                stop_event.clear()
+                start_global_stream()
+                import winsound
+                winsound.Beep(1000, 100)
+                print("\nF2 开始录音...")
+                
+                callback_f2 = ASRCallbackF2()
+                from dashscope.audio.asr import Recognition
+                recognition_f2 = Recognition(
+                    model=ASR_MODEL,
+                    format='pcm',
+                    sample_rate=SAMPLE_RATE,
+                    callback=callback_f2
+                )
+                recognition_f2.start()
+                
+                sender_thread = threading.Thread(target=audio_sender_f2, daemon=True)
+                sender_thread.start()
+            except Exception as e:
+                is_recording_f2 = False
+                recognition_f2 = None
+                callback_f2 = None
+                stop_global_stream()
+                write_runtime_log(f"toggle_f2 start failed: {e}")
+                print(f"F2 启动失败: {e}")
+                try:
+                    import winsound
+                    winsound.Beep(400, 300)
+                except Exception:
+                    pass
         else:
             is_recording_f2 = False
+            import winsound
             winsound.Beep(800, 100)
             print("\nF2 停止录音...")
             
             if recognition_f2 and callback_f2:
-                recognition_f2.stop()
+                # 使用超时机制停止识别
+                stop_result = [False]
+                def stop_recognition():
+                    try:
+                        recognition_f2.stop()
+                        stop_result[0] = True
+                    except Exception as e:
+                        print(f"停止识别失败: {e}")
+                
+                stop_thread = threading.Thread(target=stop_recognition, daemon=True)
+                stop_thread.start()
+                stop_thread.join(timeout=5)  # 5秒超时
+                
+                if not stop_result[0]:
+                    print("识别停止超时，强制结束...")
+                    import winsound
+                    winsound.Beep(400, 500)  # 错误提示音
+                
                 time.sleep(0.5)
-                if callback_f2.full_text:
-                    paste_text(callback_f2.full_text)
+                
+                # 处理识别结果
+                if callback_f2 and callback_f2.full_text:
+                    text = callback_f2.full_text
+                    print(f"F2识别结果: {text[:50]}...")
+                    paste_text(text)
+                    import winsound
                     winsound.Beep(600, 150)
+                else:
+                    print("F2未识别到文本")
+                    import winsound
+                    winsound.Beep(400, 200)  # 提示音表示未识别
+                
                 stop_global_stream()
                 recognition_f2 = None
                 callback_f2 = None
@@ -645,10 +846,12 @@ def toggle_f4():
             audio_queue_f4 = []
             stop_event.clear()
             start_global_stream()
+            import winsound
             winsound.Beep(1000, 100)
             print("\nF4 开始录音...")
             
             callback_f4 = ASRCallbackF4()
+            from dashscope.audio.asr import Recognition
             recognition_f4 = Recognition(
                 model=ASR_MODEL,
                 format='pcm',
@@ -661,14 +864,46 @@ def toggle_f4():
             sender_thread.start()
         else:
             is_recording_f4 = False
+            import winsound
             winsound.Beep(800, 100)
             print("\nF4 停止录音...")
             
             if recognition_f4 and callback_f4:
                 callback_f4.manual_stop = True
-                recognition_f4.stop()
+                
+                # 使用超时机制停止识别
+                stop_result = [False]
+                def stop_recognition():
+                    try:
+                        recognition_f4.stop()
+                        stop_result[0] = True
+                    except Exception as e:
+                        print(f"停止识别失败: {e}")
+                
+                stop_thread = threading.Thread(target=stop_recognition, daemon=True)
+                stop_thread.start()
+                stop_thread.join(timeout=5)  # 5秒超时
+                
+                if not stop_result[0]:
+                    print("识别停止超时，强制结束...")
+                    import winsound
+                    winsound.Beep(400, 500)  # 错误提示音
+                
                 time.sleep(1)
+                
+                # 如果on_complete没有被调用，手动处理
+                if callback_f4 and callback_f4.full_text:
+                    print(f"手动处理F4识别结果: {callback_f4.full_text[:50]}...")
+                    print(f"正在调用 AI ({LLM_MODEL})...")
+                    response = generate_response(callback_f4.full_text)
+                    if response:
+                        print(f"AI 回答: {response}")
+                        paste_text(response)
+                        import winsound
+                        winsound.Beep(600, 150)
+                
                 stop_global_stream()
+                
                 recognition_f4 = None
                 callback_f4 = None
 
@@ -679,6 +914,7 @@ def on_quit(icon, item):
         recognition_f2.stop()
     if recognition_f4:
         recognition_f4.stop()
+    clear_registered_hotkeys()
     stop_global_stream()
     icon.stop()
     os._exit(0)
@@ -755,6 +991,7 @@ def on_settings(icon, item):
 
 # 创建菜单
 def create_menu():
+    import pystray
     # 创建模型子菜单
     asr_menu_items = []
     for model in ASR_MODELS:
@@ -799,22 +1036,17 @@ def main():
         if not ASR_API_KEY or not LLM_API_KEY:
             print("仍然没有有效的 API Key，程序退出")
             return
+        # 更新 dashscope.api_key
+        import dashscope
+        dashscope.api_key = ASR_API_KEY
     else:
         print("从 config.json 加载配置成功")
+        # 设置 dashscope.api_key
+        import dashscope
+        dashscope.api_key = ASR_API_KEY
     
-    # 注册热键
-    try:
-        keyboard.add_hotkey(HOTKEY_F2, toggle_f2)
-        keyboard.add_hotkey(HOTKEY_F4, toggle_f4)
-        print(f"热键注册成功: F2={HOTKEY_F2}, F4={HOTKEY_F4}")
-    except Exception as e:
-        print(f"热键注册失败: {e}")
-        print("请检查热键是否与其他应用冲突")
-    
-    # 测试LLM模型
-    test_llm_models()
-    
-    # 创建图标
+    # 提前创建托盘图标，让用户尽快看到应用程序已启动
+    import pystray
     icon = pystray.Icon(
         "magic_voice",
         create_icon(),
@@ -828,7 +1060,16 @@ def main():
     print(f"大模型: {LLM_MODEL}")
     print(f"按 {HOTKEY_F2}: 听写模式（按一次开始，说完按一次结束，自动粘贴）")
     print(f"按 {HOTKEY_F4}: 上帝模式（按一次开始，说完按一次结束，AI 回答）")
+    print(f"备用热键: F2={HOTKEY_F2_FALLBACK}, F4={HOTKEY_F4_FALLBACK}")
     print("右键托盘图标退出")
+    
+    # 注册热键（放在托盘图标创建后，因为这可能需要一些时间）
+    try:
+        register_hotkeys()
+    except Exception as e:
+        print(f"热键注册失败: {e}")
+        write_runtime_log(f"hotkey register failed: {e}")
+        print("请检查热键是否与其他应用冲突")
     
     # 运行图标
     icon.run()
